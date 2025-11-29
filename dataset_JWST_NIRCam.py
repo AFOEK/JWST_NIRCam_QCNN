@@ -1,0 +1,302 @@
+import os, pathlib, warnings
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+from astroquery.mast import Observations
+from astropy.io import fits
+from astropy.wcs import WCS
+from astropy.stats import sigma_clipped_stats
+from astropy.nddata import Cutout2D
+from reproject import reproject_interp
+
+from photutils.segmentation import detect_threshold, detect_sources, deblend_sources
+from photutils.segmentation import SourceCatalog
+from skimage.transform import resize
+
+OUT_DIR = pathlib.Path("JWST_NIRCam_Triple_Filter")
+REFENCES_BAND = "F200W" #References filter
+BANDS = ["F200W", "F277W", "F444W"] #it should have 16,242 images catalogues. Public access only, with calibiration level 2-4
+
+CALIB_MIN, CALIB_MAX = 2, 4
+MAX_MATCH_ARCSEC = 1.0
+CUTOUT_PIX = 64
+MIN_AREA = 20
+THRESHOLD_SIGMA = 3.0
+MAX_SOURCES_PER_FIELD = 200
+POOL_GRID = 4
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+FITS_DIR = OUT_DIR / "fits"
+FITS_DIR.mkdir(exist_ok=True)
+
+def arcsec_sep(ra1, dec1, ra2, dec2):
+    d2r = np.pi/100.0
+    x = (ra2 - ra1) * np.cos(0.5 * (dec1 + dec2) * d2r)
+    y = dec2 - dec1
+    return 3600.0 * np.sqrt(x*x + y*y)
+
+def robust_scale(im):
+    im = np.nan_to_num(im, copy = False)
+    p1, p99 = np.percentile(im, [1, 99])
+    im = im - np.median(im)
+    scale = (p99 - p1) if (p99 > p1) else (np.std(im) + 1e-12)
+    im = (im - p1) / (scale + 1e-12)
+    return np.clip(im, -5, 5)
+
+def z_score(im):
+    s = np.std(im)
+    return (im - np.mean(im)) / s if s > 0 else (im - np.mean(im))
+
+def is_mosaic_filename(filename):
+    return (("_i2d.fits" in filename) or ("_drc.fits" in filename))
+
+def filename_has_filter(filename, filter):
+    return filter.lower() in filename.lower()
+
+def query_band_products(filter_name):
+    obs = Observations.query_criteria(
+        obs_collection="JWST",
+        instrument_name="NIRCAM/IMAGE",
+        filters=filter_name,
+        dataproduct_type="image",
+        dataRights="PUBLIC"
+    )
+    if len(obs) == 0:
+        return pd.DataFrame()
+    
+    products = Observations.get_product_list(obs)
+    df = products.to_pandas()
+
+    df = df[df["productFilename"].str.endwith(".fits", na=False)].copy()
+
+    if "calib_level" in df.columns:
+        df = df[df["calib_level"].isna() | df["calib_level"].between(CALIB_MIN, CALIB_MAX, inclusive = "both")]
+
+    df = df[df["productFilename"].apply(is_mosaic_filename)].copy()
+
+    df.drop_duplicates(subset=["productFilename"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+def split_by_band(df):
+    out = {}
+    for b in BANDS:
+        mask = df["productFilename"].apply(lambda f: filename_has_filter(f,b))
+        sub = df[mask].copy().reset_index(drop=True)
+        out[b] = sub
+        print(f"[band={b}] mosaics found: {len(sub)}")
+    return out
+
+def match_triplets(df_F200, df_F277, df_F444, tol_arcsec=1.0):
+    triplets = []
+    used_277 = set()
+    used_444 = set()
+
+    for i, a in df_F200.iterrows():
+        ra, dec = a["s_ra"], a["s_dec"]
+        j_best, d_best = None, 1e9
+        for j, b in df_F277.iterrows():
+            if j in used_277:
+                continue
+            d= arcsec_sep(ra, dec, b["s_ra"], b["s_dec"])
+            if d < d_best:
+                d_best, j_best = d, j
+        if j_best is None or d_best > tol_arcsec:
+            continue
+
+        k_best, d2_best = None, 1e9
+        for k, c in df_F444.iterrows():
+            if k in used_444:
+                continue
+            d2 = arcsec_sep(ra, dec, c["s_ra"], c["s_dec"])
+            if d2 < d2_best:
+                d2_best, k_best = d2, k
+        if k_best is None or d2_best > tol_arcsec:
+            continue
+
+        triplets.append((i, j_best, k_best))
+        used_277.add(j_best)
+        used_444.add(k_best)
+    
+    return triplets
+
+def download_if_needed(row):
+    uri = row["dataURI"]
+    fname = uri.split("/")[-1]
+    dest = FITS_DIR / fname
+    if not dest.exists():
+        manifest = Observations.download_products(
+            pd.DataFrame([row]),
+            mrp_only=False,
+            download_dir=str(FITS_DIR),
+            dataproduct_type="image"
+        )
+
+        paths = [p for p in manifest["Local Path"] if p.endswith(fname)]
+        if len(paths) > 0:
+            p = pathlib.Path(paths[0])
+            p.rename(dest)
+        else:
+            if not dest.exists():
+                raise RuntimeError(f"Could not locate downloaded file for {fname}")
+    
+    return dest
+
+def read_sci(fits_path):
+    with fits.open(fits_path, memmap=True) as hdul:
+        for h in hdul:
+            if h.data is not None and h.data.ndim == 2:
+                return h.data.astype(np.float64), h.header.copy()
+    
+    raise ValueError(f"No 2D image found in {fits_path}")
+
+def reproject_to(ref_img, ref_hdr, mov_img, mov_hdr):
+    w_ref = WCS(ref_hdr)
+    w_mov = WCS(mov_hdr)
+    out_shape = ref_img.shape
+    mov_on_ref, _ = reproject_interp((mov_img, w_mov), w_ref, shape_out=out_shape)
+    return mov_on_ref
+
+def detect_sources_on(img):
+    mean, med, std = sigma_clipped_stats(img, sigma=3.0, maxiters=5)
+    thres = detect_threshold(img, nsigma=THRESHOLD_SIGMA)
+    segm = detect_sources(img, thres, npixels=MIN_AREA)
+    if segm is None:
+        return None, None
+    
+    segm = deblend_sources(img, segm, npixels=MIN_AREA, nlevels=16, contrast=0.001)
+    cat = SourceCatalog(img, segm)
+
+    tbl = cat.to_table()
+    tbl.store("segment_flux", reverse=True)
+    if len(tbl) > MAX_SOURCES_PER_FIELD:
+        tbl = tbl[:MAX_SOURCES_PER_FIELD]
+    return segm, tbl
+
+def cutout_stack(ref_img, hdr_ref, imgs_dict, xy, size_pix=64):
+    pos = (xy[0], xy[1])
+    wref = WCS(hdr_ref)
+    stacks = []
+    for band in BANDS:
+        im = imgs_dict[band]
+        co = Cutout2D(im, position=pos, size=(size_pix, size_pix), wcs=wref, mode="partial", fill_value=0.0)
+        x = z_score(resize(co.data, (size_pix, size_pix), anti_aliasing=True, preserve_range=True))
+        stacks.append(x)
+    return np.stack(stacks, axis=-1).astype(np.float32)
+
+def avg_pool_grid(img, grid=4):
+    H, W = img.shape
+    gh = H // grid
+    gw = W // grid
+    img = img[:gh*grid, :gw*grid]
+    pooled = img.reshape(grid, gh, grid, gw).mean(axis=(1,3))
+    return pooled
+
+def pooled_features_from_stamp(stamp3, grid=4):
+    features = []
+    stats = []
+    for ch in range(stamp3.shape[-1]):
+        pooled = avg_pool_grid(stamp3[:, :, ch], grid=grid)
+        features.append(pooled.flatten())
+        stats.extend([np.mean(stamp3[:, :, ch]), np.std(stamp3[:, :, ch])])
+    
+    vectors = np.concatenate(features + [np.array(stats, dtype=np.float32)], axis=0).astype(np.float32)
+    return vectors
+
+def main():
+    df_F200 = query_band_products("F200W")
+    df_F277 = query_band_products("F277W")
+    df_F444 = query_band_products("F444W")
+
+    print(f"Filter F200W counts:{len(df_F200)};\nFilter F277W counts:{len(df_F277)};\nFilter F444W counts:{len(df_F444)}")
+
+    if df_F200.empty or df_F277.empty or df_F444.empty:
+        raise SystemExit("One of the bands still empty. Check filename and verify again !")
+    
+    print(f"Products: F200W={len(df_F200)}, F277W={len(df_F277)}, and F444W={len(df_F444)}")
+    triplets = match_triplets(df_F200, df_F277, df_F444, tol_arcsec=MAX_MATCH_ARCSEC)
+    print(f"Matched triplets (fields): {len(triplets)}")
+
+    X_imgs = []
+    X_pooled = []
+    meta_rows = []
+    for i200, i277, i444 in tqdm(triplets, desc="Fields (triplets)"):
+        r200 = df_F200.loc[i200]
+        r277 = df_F277.loc[i277]
+        r444 = df_F444.loc[i444]
+
+        try:
+            f200 = download_if_needed(r200)
+            f277 = download_if_needed(r277)
+            f444 = download_if_needed(r444)
+
+            img200, hdr200 = read_sci(f200)
+            img277, hdr277 = read_sci(f277)
+            img444, hdr444 = read_sci(f444)
+
+            img200 = robust_scale(img200)
+            img277 = robust_scale(img277)
+            img444 = robust_scale(img444)
+
+            on200_277 = reproject_to(img200, hdr200, img277, hdr277)
+            on200_444 = reproject_to(img200, hdr200, img444, hdr444)
+
+            _, tbl = detect_sources_on(img200)
+            if tbl is None or len(tbl) == 0:
+                continue
+
+            for row in tbl:
+                xc = float(row["xcentroid"])
+                yc = float(row["ycentroid"])
+                stamp = cutout_stack(
+                    ref_img=img200,
+                    hdr_ref=hdr200,
+                    imgs_dict={"F200W":img200, "F277W":on200_277, "F444W":on200_444},
+                    xy=(xc, yc),
+                    size_pix=CUTOUT_PIX
+                )
+                X_imgs.append(stamp)
+                X_pooled.append(pooled_features_from_stamp(stamp, grid=POOL_GRID))
+                meta_rows.append({
+                    "ra":float(r200["s_ra"]),
+                    "dec":float(r200["s_dec"]),
+                    "obsID_200": r200["obsID"],
+                    "obsID_277": r277["obsID"],
+                    "obsID_444": r444["obsID"],
+                    "uri_200": r200["dataURI"],
+                    "uri_277": r277["dataURI"],
+                    "uri_444": r444["dataURI"],
+                    "filename_200": r200["productFilename"],
+                    "filename_277": r277["productFilename"],
+                    "filename_444": r444["productFilename"]
+                })
+
+        except Exception as e:
+            warnings.warn(f"Triplets failed: {e}")
+            continue
+    
+    if len(X_imgs) == 0:
+        raise SystemExit("No cutouts produced. Try relaxing MIN_AREA/THRESH_SIG, or this field has few sources")
+    
+    X_imgs = np.stack(X_imgs, axis=0)
+    X_pooled = np.stack(X_pooled, axis=0)
+    meta = pd.DataFrame(meta_rows)
+
+    out_npz = OUT_DIR/f"nircam_{'-'.join(BANDS)}_{CUTOUT_PIX}px_triplets.npz"
+    np.savez_compressed(out_npz, X_imgs=X_imgs.astype(np.float32), X_pooled=X_pooled.astype(np.float32))
+    meta.to_csv(OUT_DIR/f"nircam_{'-'.join(BANDS)}_meta.csv", index=False)
+
+    print(f"Saved: {out_npz} with X_imgs shape {X_imgs.shape}, X_polled shape {X_pooled.shape}")
+    print(f"Saved meta CSV with {len(meta)} rows")
+
+if __name__ == "__main__":
+    main()
+
+    # for f in ["F200W", "F277W", "F444W"]:
+    #     obs = Observations.query_criteria(
+    #     obs_collection="JWST",
+    #     instrument_name="NIRCAM/IMAGE",
+    #     filters=f,
+    # )
+    # print(f, len(obs))
