@@ -1,4 +1,4 @@
-import os, pathlib, warnings
+import os, pathlib, warnings, time
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -6,6 +6,7 @@ from tqdm import tqdm
 from astroquery.mast import Observations
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.table import vstack
 from astropy.stats import sigma_clipped_stats
 from astropy.nddata import Cutout2D
 from reproject import reproject_interp
@@ -17,6 +18,7 @@ from skimage.transform import resize
 OUT_DIR = pathlib.Path("JWST_NIRCam_Triple_Filter")
 REFENCES_BAND = "F200W" #References filter
 BANDS = ["F200W", "F277W", "F444W"] #it should have 16,242 images catalogues. Public access only, with calibiration level 2-4
+MAX_OBS_PER_BAND = 5000
 
 CALIB_MIN, CALIB_MAX = 2, 4
 MAX_MATCH_ARCSEC = 1.0
@@ -31,7 +33,7 @@ FITS_DIR = OUT_DIR / "fits"
 FITS_DIR.mkdir(exist_ok=True)
 
 def arcsec_sep(ra1, dec1, ra2, dec2):
-    d2r = np.pi/100.0
+    d2r = np.pi/180.0
     x = (ra2 - ra1) * np.cos(0.5 * (dec1 + dec2) * d2r)
     y = dec2 - dec1
     return 3600.0 * np.sqrt(x*x + y*y)
@@ -54,7 +56,9 @@ def is_mosaic_filename(filename):
 def filename_has_filter(filename, filter):
     return filter.lower() in filename.lower()
 
-def query_band_products(filter_name):
+def query_band_products(filter_name, step=1000):
+    print(f"[Query] JWST NIRCAM/IMAGE, filter={filter_name}")
+    Observations.TIMEOUT = 3600
     obs = Observations.query_criteria(
         obs_collection="JWST",
         instrument_name="NIRCAM/IMAGE",
@@ -65,18 +69,52 @@ def query_band_products(filter_name):
     if len(obs) == 0:
         return pd.DataFrame()
     
-    products = Observations.get_product_list(obs)
-    df = products.to_pandas()
+    if len(obs) > MAX_OBS_PER_BAND:
+        print(f"[Query] {filter_name}: {len(obs)} observations total, "
+              f"capping to first {MAX_OBS_PER_BAND} to avoid timeouts.")
+        idx = np.random.choice(len(obs), size=MAX_OBS_PER_BAND, replace=False)
+        obs = obs[idx]
 
-    df = df[df["productFilename"].str.endwith(".fits", na=False)].copy()
+    obs_df = obs.to_pandas()
+    print(f"[Query] {filter_name}: {len(obs_df)} observations;\nFetching products in batches !")
+    print(f"[Query] Fetching products in batches of {step} ...")
 
+    products_table = None
+
+    total = len(obs)
+    n_batches = (total + step - 1) // step
+    for b in range(n_batches):
+        i = b * step
+        batch = obs[i:i+step]
+
+        print(f"  → batch {b+1}/{n_batches}: obs[{i}:{i+len(batch)}] ... ", end="", flush=True)
+        t0 = time.time()
+
+        products = Observations.get_product_list(batch)
+
+        if products_table is None:
+            products_table = products
+        else:
+            products_table = vstack([products_table, products])
+
+        dt = time.time() - t0
+        print(f"done ({len(products)} products, {dt:.1f}s)")
+
+    if products_table is None or len(products_table) == 0:
+        print(f"[Warn] No products for {filter_name}")
+        return pd.DataFrame()
+
+    df = products_table.to_pandas()
+
+    df =  df[df["productFilename"].str.endswith(".fits", na=False)].copy()
     if "calib_level" in df.columns:
-        df = df[df["calib_level"].isna() | df["calib_level"].between(CALIB_MIN, CALIB_MAX, inclusive = "both")]
-
-    df = df[df["productFilename"].apply(is_mosaic_filename)].copy()
-
+        df = df[df["calib_level"].isna() | df["calib_level"].between(CALIB_MIN, CALIB_MAX, inclusive="both")]
+    
+    df = df[df["productFilename"].apply(lambda func: filename_has_filter(func, filter_name))]
     df.drop_duplicates(subset=["productFilename"], inplace=True)
     df.reset_index(drop=True, inplace=True)
+
+    print(f"[Query] {filter_name}: {len(df)} mosaic products kept")
     return df
 
 def split_by_band(df):
@@ -169,7 +207,7 @@ def detect_sources_on(img):
     cat = SourceCatalog(img, segm)
 
     tbl = cat.to_table()
-    tbl.store("segment_flux", reverse=True)
+    tbl.sort("segment_flux", reverse=True)
     if len(tbl) > MAX_SOURCES_PER_FIELD:
         tbl = tbl[:MAX_SOURCES_PER_FIELD]
     return segm, tbl
@@ -205,11 +243,12 @@ def pooled_features_from_stamp(stamp3, grid=4):
     return vectors
 
 def main():
-    df_F200 = query_band_products("F200W")
-    df_F277 = query_band_products("F277W")
-    df_F444 = query_band_products("F444W")
+    print("Querying band from MAST")
+    df_F200 = query_band_products("F200W", step=250)
+    df_F277 = query_band_products("F277W", step=250)
+    df_F444 = query_band_products("F444W", step=250)
 
-    print(f"Filter F200W counts:{len(df_F200)};\nFilter F277W counts:{len(df_F277)};\nFilter F444W counts:{len(df_F444)}")
+    print(f"Filter F200W counts:{len(df_F200)};\nFilter F277W counts:{len(df_F277)};\nFilter F444W counts:{len(df_F444)}\n")
 
     if df_F200.empty or df_F277.empty or df_F444.empty:
         raise SystemExit("One of the bands still empty. Check filename and verify again !")
