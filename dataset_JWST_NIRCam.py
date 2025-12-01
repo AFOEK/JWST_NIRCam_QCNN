@@ -32,6 +32,20 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 FITS_DIR = OUT_DIR / "fits"
 FITS_DIR.mkdir(exist_ok=True)
 
+CACHE_DIR = OUT_DIR / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+def cache_save_df(df, band):
+    df.to_parquet(CACHE_DIR / f"{band}_products.parquet", index=False)
+    print(f"[Cache] Saved {band} ({len(df)}) to cache/{band}_products.parquet")
+
+def load_band_df(band):
+    path = CACHE_DIR / f"{band}_products.parquet"
+    if path.exists():
+        print(f"[Cache] Loaded cached {band} products")
+        return pd.read_parquet(path)
+    return None
+
 def arcsec_sep(ra1, dec1, ra2, dec2):
     d2r = np.pi/180.0
     x = (ra2 - ra1) * np.cos(0.5 * (dec1 + dec2) * d2r)
@@ -57,7 +71,7 @@ def filename_has_filter(filename, filter):
     return filter.lower() in filename.lower()
 
 def query_band_products(filter_name, step=1000):
-    print(f"[Query] JWST NIRCAM/IMAGE, filter={filter_name}")
+    print(f"[Query] JWST NIRCAM/IMAGE, filter = {filter_name}")
     Observations.TIMEOUT = 3600
     obs = Observations.query_criteria(
         obs_collection="JWST",
@@ -109,8 +123,25 @@ def query_band_products(filter_name, step=1000):
     df =  df[df["productFilename"].str.endswith(".fits", na=False)].copy()
     if "calib_level" in df.columns:
         df = df[df["calib_level"].isna() | df["calib_level"].between(CALIB_MIN, CALIB_MAX, inclusive="both")]
+
+    if "productType" in df.columns:
+        df = df[df["productType"].str.upper() == "SCIENCE"]
     
     df = df[df["productFilename"].apply(lambda func: filename_has_filter(func, filter_name))]
+
+    if "productSubGroupDescription" in df.columns:
+        df = df[df["productSubGroupDescription"].str.lower().str.contains("i2d", na=False)]
+
+    if "obsid" in obs_df.columns:
+        obs_pos = obs_df[["obsid", "s_ra", "s_dec"]].copy()
+        if "obsID" in df.columns:
+            df = df.merge(obs_pos, left_on="obsID", right_on="obsid", how="left")
+            df.drop(columns=["obsid"], inplace=True)
+        else:
+            print(f"[Warn] obsID column not found in the products list for {filter_name}, RA/Dec may be missing")
+    else:
+        print(f"[Warn] obsid/s_ra/s_dec not found in obs table for {filter_name}")
+
     df.drop_duplicates(subset=["productFilename"], inplace=True)
     df.reset_index(drop=True, inplace=True)
 
@@ -127,17 +158,24 @@ def split_by_band(df):
     return out
 
 def match_triplets(df_F200, df_F277, df_F444, tol_arcsec=1.0):
+    print(f"[Info] Matching triplets")
     triplets = []
     used_277 = set()
     used_444 = set()
 
     for i, a in df_F200.iterrows():
-        ra, dec = a["s_ra"], a["s_dec"]
+        ra, dec = a.get("s_ra", np.nan), a.get("s_dec", np.nan)
+        if not np.isfinite(ra) or not np.isfinite(dec):
+            continue
+
         j_best, d_best = None, 1e9
         for j, b in df_F277.iterrows():
             if j in used_277:
                 continue
-            d= arcsec_sep(ra, dec, b["s_ra"], b["s_dec"])
+            ra2, dec2 = b.get("s_ra", np.nan), b.get("s_dec", np.nan)
+            if not np.isfinite(ra2) or not np.isfinite(dec2):
+                continue
+            d= arcsec_sep(ra, dec, ra2, dec2)
             if d < d_best:
                 d_best, j_best = d, j
         if j_best is None or d_best > tol_arcsec:
@@ -147,7 +185,10 @@ def match_triplets(df_F200, df_F277, df_F444, tol_arcsec=1.0):
         for k, c in df_F444.iterrows():
             if k in used_444:
                 continue
-            d2 = arcsec_sep(ra, dec, c["s_ra"], c["s_dec"])
+            ra3, dec3 = c.get("s_ra", np.nan), c.get("s_dec", np.nan)
+            if not np.isfinite(ra3) or not np.isfinite(dec3):
+                continue
+            d2 = arcsec_sep(ra, dec, ra3, dec3)
             if d2 < d2_best:
                 d2_best, k_best = d2, k
         if k_best is None or d2_best > tol_arcsec:
@@ -163,22 +204,23 @@ def download_if_needed(row):
     uri = row["dataURI"]
     fname = uri.split("/")[-1]
     dest = FITS_DIR / fname
-    if not dest.exists():
-        manifest = Observations.download_products(
-            pd.DataFrame([row]),
-            mrp_only=False,
-            download_dir=str(FITS_DIR),
-            dataproduct_type="image"
-        )
 
-        paths = [p for p in manifest["Local Path"] if p.endswith(fname)]
-        if len(paths) > 0:
-            p = pathlib.Path(paths[0])
-            p.rename(dest)
-        else:
-            if not dest.exists():
-                raise RuntimeError(f"Could not locate downloaded file for {fname}")
+    if dest.exists():
+        return dest
     
+    print(f"[Download] Mosaics for {fname}\n")
+    try:
+        Observations.download_file(
+            uri=uri,
+            local_path=str(dest),
+            cache=False,
+            verbose=True
+        )
+    except Exception as e:
+        raise RuntimeError(f"Download failed for {uri}: {e}")
+    
+    if not dest.exists():
+        raise RuntimeError(f"File not found after download: {dest}")
     return dest
 
 def read_sci(fits_path):
@@ -243,17 +285,30 @@ def pooled_features_from_stamp(stamp3, grid=4):
     return vectors
 
 def main():
-    print("Querying band from MAST")
-    df_F200 = query_band_products("F200W", step=250)
-    df_F277 = query_band_products("F277W", step=250)
-    df_F444 = query_band_products("F444W", step=250)
+    print("[Info] Trying load existing caches")
+    df_F200 = load_band_df("F200W")
+    df_F277 = load_band_df("F277W")
+    df_F444 = load_band_df("F444W")
 
-    print(f"Filter F200W counts:{len(df_F200)};\nFilter F277W counts:{len(df_F277)};\nFilter F444W counts:{len(df_F444)}\n")
+    if df_F200 is None:
+        print("[Info] No existing filter cache can be found\n[Info] Querying band from MAST")
+        df_F200 = query_band_products("F200W", step=250)
+        cache_save_df(df_F200, "F200W")
+    if df_F277 is None:
+        print("[Info] No existing filter cache can be found\n[Info] Querying band from MAST")
+        df_F277 = query_band_products("F277W", step=250)
+        cache_save_df(df_F277, "F277W")
+    if df_F444 is None:
+        print("[Info] No existing filter cache can be found\n[Info] Querying band from MAST")
+        df_F444 = query_band_products("F444W", step=250)
+        cache_save_df(df_F444, "F444W")
+    
+    print(f"Filter F200W counts:{len(df_F200)};\nFilter F277W counts:{len(df_F277)};\nFilter F444W counts:{len(df_F444)}")
 
     if df_F200.empty or df_F277.empty or df_F444.empty:
         raise SystemExit("One of the bands still empty. Check filename and verify again !")
     
-    print(f"Products: F200W={len(df_F200)}, F277W={len(df_F277)}, and F444W={len(df_F444)}")
+    print(f"Products: F200W = {len(df_F200)}, F277W = {len(df_F277)}, and F444W = {len(df_F444)}\n")
     triplets = match_triplets(df_F200, df_F277, df_F444, tol_arcsec=MAX_MATCH_ARCSEC)
     print(f"Matched triplets (fields): {len(triplets)}")
 
