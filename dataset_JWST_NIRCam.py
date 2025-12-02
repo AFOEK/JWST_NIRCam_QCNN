@@ -1,11 +1,11 @@
-import os, pathlib, warnings, time
+import os, pathlib, warnings, time, warnings
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from astroquery.mast import Observations
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 from astropy.table import vstack
 from astropy.stats import sigma_clipped_stats
 from astropy.nddata import Cutout2D
@@ -15,10 +15,12 @@ from photutils.segmentation import detect_threshold, detect_sources, deblend_sou
 from photutils.segmentation import SourceCatalog
 from skimage.transform import resize
 
+warnings.filterwarnings("ignore", category=FITSFixedWarning)
+
 OUT_DIR = pathlib.Path("JWST_NIRCam_Triple_Filter")
 REFENCES_BAND = "F200W" #References filter
 BANDS = ["F200W", "F277W", "F444W"] #it should have 16,242 images catalogues. Public access only, with calibiration level 2-4
-MAX_OBS_PER_BAND = 5000
+MAX_OBS_PER_BAND = 2500
 
 CALIB_MIN, CALIB_MAX = 2, 4
 MAX_MATCH_ARCSEC = 1.0
@@ -210,33 +212,55 @@ def download_if_needed(row):
     
     print(f"[Download] Mosaics for {fname}\n")
     try:
-        Observations.download_file(
+        manifest = Observations.download_file(
             uri=uri,
-            local_path=str(dest),
+            local_path=str(FITS_DIR),
             cache=False,
             verbose=True
         )
     except Exception as e:
         raise RuntimeError(f"Download failed for {uri}: {e}")
     
-    if not dest.exists():
-        raise RuntimeError(f"File not found after download: {dest}")
-    return dest
+    dl_path = pathlib.Path(manifest)
+    
+    if not dl_path.exists():
+        raise RuntimeError(f"File not found after download: {dl_path}")
+    return dl_path
 
 def read_sci(fits_path):
     with fits.open(fits_path, memmap=True) as hdul:
-        for h in hdul:
+        if "SCI" in hdul:
+            data = hdul["SCI"].data
+            hdr = hdul["SCI"].header
+            if data is not None and data.ndim == 2:
+                return data.astype(np.float64), hdr
+        
+        for h in hdul[1:]:
             if h.data is not None and h.data.ndim == 2:
-                return h.data.astype(np.float64), h.header.copy()
-    
-    raise ValueError(f"No 2D image found in {fits_path}")
+                return h.datra.astype(np.float64), h.header.copy()
+            
+    raise ValueError(f"No 2d SCI imaghe found in {fits_path}")
 
 def reproject_to(ref_img, ref_hdr, mov_img, mov_hdr):
-    w_ref = WCS(ref_hdr)
-    w_mov = WCS(mov_hdr)
-    out_shape = ref_img.shape
-    mov_on_ref, _ = reproject_interp((mov_img, w_mov), w_ref, shape_out=out_shape)
-    return mov_on_ref
+    try:
+        w_ref = WCS(ref_hdr)
+        w_mov = WCS(mov_hdr)
+        out_shape = ref_img.shape
+        mov_on_ref, _ = reproject_interp((mov_img, w_mov), w_ref, shape_out=out_shape)
+        if not np.isfinite(mov_on_ref).any():
+            raise RuntimeError("Reproject produces all-NaN images.")
+        mov_on_ref = np.nan_to_num(mov_on_ref, copy=False)
+        return mov_on_ref
+    except Exception as e:
+        warnings.warn(f"reproject_interp failed ({e}), falling back to resize().")
+        mov_resized = resize(
+            mov_img,
+            out_shape,
+            preserve_range=True,
+            anti_aliasing=True
+        )
+        mov_resized = np.nan_to_num(mov_resized, copy=False)
+        return mov_resized
 
 def detect_sources_on(img):
     mean, med, std = sigma_clipped_stats(img, sigma=3.0, maxiters=5)
@@ -261,7 +285,8 @@ def cutout_stack(ref_img, hdr_ref, imgs_dict, xy, size_pix=64):
     for band in BANDS:
         im = imgs_dict[band]
         co = Cutout2D(im, position=pos, size=(size_pix, size_pix), wcs=wref, mode="partial", fill_value=0.0)
-        x = z_score(resize(co.data, (size_pix, size_pix), anti_aliasing=True, preserve_range=True))
+        data = np.nan_to_num(co.data, copy=False)
+        x = z_score(resize(data, (size_pix, size_pix), anti_aliasing=True, preserve_range=True))
         stacks.append(x)
     return np.stack(stacks, axis=-1).astype(np.float32)
 
