@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore", category=FITSFixedWarning)
 OUT_DIR = pathlib.Path("JWST_NIRCam_Triple_Filter")
 REFENCES_BAND = "F200W" #References filter
 BANDS = ["F200W", "F277W", "F444W"] #it should have 16,242 images catalogues. Public access only, with calibiration level 2-4
-MAX_OBS_PER_BAND = 2500
+MAX_OBS_PER_BAND = 1500
 
 CALIB_MIN, CALIB_MAX = 2, 4
 MAX_MATCH_ARCSEC = 1.0
