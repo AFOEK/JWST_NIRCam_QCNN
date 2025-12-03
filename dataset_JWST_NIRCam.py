@@ -1,4 +1,4 @@
-import os, pathlib, warnings, time, warnings
+import os, io, pathlib, warnings, time, warnings
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -15,12 +15,15 @@ from photutils.segmentation import detect_threshold, detect_sources, deblend_sou
 from photutils.segmentation import SourceCatalog
 from skimage.transform import resize
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import redirect_stdout, redirect_stderr
+
 warnings.filterwarnings("ignore", category=FITSFixedWarning)
 
 OUT_DIR = pathlib.Path("JWST_NIRCam_Triple_Filter")
 REFENCES_BAND = "F200W" #References filter
 BANDS = ["F200W", "F277W", "F444W"] #it should have 16,242 images catalogues. Public access only, with calibiration level 2-4
-MAX_OBS_PER_BAND = 2500
+MAX_OBS_PER_BAND = 3500
 
 CALIB_MIN, CALIB_MAX = 2, 4
 MAX_MATCH_ARCSEC = 1.0
@@ -88,8 +91,7 @@ def query_band_products(filter_name, step=1000):
     if len(obs) > MAX_OBS_PER_BAND:
         print(f"[Query] {filter_name}: {len(obs)} observations total, "
               f"capping to first {MAX_OBS_PER_BAND} to avoid timeouts.")
-        idx = np.random.choice(len(obs), size=MAX_OBS_PER_BAND, replace=False)
-        obs = obs[idx]
+        obs = obs[:MAX_OBS_PER_BAND]
 
     obs_df = obs.to_pandas()
     print(f"[Query] {filter_name}: {len(obs_df)} observations;\nFetching products in batches !")
@@ -212,20 +214,50 @@ def download_if_needed(row):
     
     print(f"[Download] Mosaics for {fname}\n")
     try:
-        manifest = Observations.download_file(
-            uri=uri,
-            local_path=str(FITS_DIR),
-            cache=False,
-            verbose=True
-        )
+        buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(buf):
+            Observations.download_file(
+                uri=uri,
+                local_path=str(dest),
+                cache=False,
+            )
     except Exception as e:
         raise RuntimeError(f"Download failed for {uri}: {e}")
     
-    dl_path = pathlib.Path(manifest)
-    
-    if not dl_path.exists():
-        raise RuntimeError(f"File not found after download: {dl_path}")
-    return dl_path
+    if not dest.exists():
+        raise RuntimeError(f"File not found after download: {dest}")
+    return dest
+
+def prefetch_all_fits(df_F200, df_F277, df_F444, max_workers=3):
+    all_df = pd.concat([df_F200, df_F277, df_F444], ignore_index=True)
+    uris = all_df["dataURI"].dropna().unique()
+
+    def worker(uri):
+        row = {"dataURI": uri}
+        try:
+            path = download_if_needed(row)
+            return (uri, True, str(path))
+        except Exception as e:
+            return (uri, False, str(e))
+        
+    print(f"[Prefetch] Downloading up to {len(uris)} FITS files with {max_workers} workers...")
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(worker, uri): uri for uri in uris}
+        with tqdm(total=len(futures), desc="Prefetch FITS", ncols=90) as pbar:
+            for fut in as_completed(futures):
+                uri = futures[fut]
+                ok_uri, ok_flag, msg = fut.result()
+
+                status = "OK" if ok_flag else "ERR"
+                pbar.set_postfix_str(f"{os.path.basename(ok_uri)} → {status}")
+                results.append((ok_uri, ok_flag, msg))
+                pbar.update(1)
+
+    n_ok = sum(1 for _, ok, _ in results if ok)
+    n_err = len(results) - n_ok
+    print(f"[Prefetch] Done: {n_ok} ok, {n_err} errors")
+
 
 def read_sci(fits_path):
     if isinstance(fits_path, (tuple, list)):
@@ -241,7 +273,7 @@ def read_sci(fits_path):
 
         for h in hdul[1:]:
             if h.data is not None and h.data.ndim == 2:
-                return h.data.astype(np.float64), h.header.copy()  # <- fixed datra→data
+                return h.data.astype(np.float64), h.header.copy()
 
     raise ValueError(f"No 2D SCI image found in {fits_path}")
 
@@ -321,25 +353,27 @@ def main():
 
     if df_F200 is None:
         print("[Info] No existing filter cache can be found\n[Info] Querying band from MAST")
-        df_F200 = query_band_products("F200W", step=250)
+        df_F200 = query_band_products("F200W", step=350)
         cache_save_df(df_F200, "F200W")
     if df_F277 is None:
         print("[Info] No existing filter cache can be found\n[Info] Querying band from MAST")
-        df_F277 = query_band_products("F277W", step=250)
+        df_F277 = query_band_products("F277W", step=350)
         cache_save_df(df_F277, "F277W")
     if df_F444 is None:
         print("[Info] No existing filter cache can be found\n[Info] Querying band from MAST")
-        df_F444 = query_band_products("F444W", step=250)
+        df_F444 = query_band_products("F444W", step=350)
         cache_save_df(df_F444, "F444W")
     
-    print(f"Filter F200W counts:{len(df_F200)};\nFilter F277W counts:{len(df_F277)};\nFilter F444W counts:{len(df_F444)}")
+    print(f"Filter F200W counts: {len(df_F200)}\nFilter F277W counts: {len(df_F277)}\nFilter F444W counts: {len(df_F444)}")
 
     if df_F200.empty or df_F277.empty or df_F444.empty:
         raise SystemExit("One of the bands still empty. Check filename and verify again !")
     
-    print(f"Products: F200W = {len(df_F200)}, F277W = {len(df_F277)}, and F444W = {len(df_F444)}\n")
+    print(f"Products: F200W = {len(df_F200)}, F277W = {len(df_F277)}, and F444W = {len(df_F444)}")
     triplets = match_triplets(df_F200, df_F277, df_F444, tol_arcsec=MAX_MATCH_ARCSEC)
     print(f"Matched triplets (fields): {len(triplets)}")
+
+    prefetch_all_fits(df_F200, df_F277, df_F444, max_workers=4)
 
     X_imgs = []
     X_pooled = []
