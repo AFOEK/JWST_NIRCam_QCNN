@@ -20,13 +20,13 @@ warnings.filterwarnings("ignore", category=FITSFixedWarning)
 OUT_DIR = pathlib.Path("JWST_NIRCam_Triple_Filter")
 REFENCES_BAND = "F200W" #References filter
 BANDS = ["F200W", "F277W", "F444W"] #it should have 16,242 images catalogues. Public access only, with calibiration level 2-4
-MAX_OBS_PER_BAND = 1500
+MAX_OBS_PER_BAND = 2500
 
 CALIB_MIN, CALIB_MAX = 2, 4
 MAX_MATCH_ARCSEC = 1.0
 CUTOUT_PIX = 64
-MIN_AREA = 20
-THRESHOLD_SIGMA = 3.0
+MIN_AREA = 10
+THRESHOLD_SIGMA = 2.0
 MAX_SOURCES_PER_FIELD = 200
 POOL_GRID = 4
 
@@ -228,18 +228,22 @@ def download_if_needed(row):
     return dl_path
 
 def read_sci(fits_path):
+    if isinstance(fits_path, (tuple, list)):
+        fits_path = fits_path[0]
+    fits_path = pathlib.Path(fits_path)
+
     with fits.open(fits_path, memmap=True) as hdul:
         if "SCI" in hdul:
             data = hdul["SCI"].data
             hdr = hdul["SCI"].header
             if data is not None and data.ndim == 2:
-                return data.astype(np.float64), hdr
-        
+                return data.astype(np.float64), hdr.copy()
+
         for h in hdul[1:]:
             if h.data is not None and h.data.ndim == 2:
-                return h.datra.astype(np.float64), h.header.copy()
-            
-    raise ValueError(f"No 2d SCI imaghe found in {fits_path}")
+                return h.data.astype(np.float64), h.header.copy()  # <- fixed datra→data
+
+    raise ValueError(f"No 2D SCI image found in {fits_path}")
 
 def reproject_to(ref_img, ref_hdr, mov_img, mov_hdr):
     try:
@@ -353,43 +357,48 @@ def main():
             img200, hdr200 = read_sci(f200)
             img277, hdr277 = read_sci(f277)
             img444, hdr444 = read_sci(f444)
+            
+            _, tbl = detect_sources_on(img200)
+            if tbl is None or len(tbl) == 0:
+                continue
+
+            print(f"[Detect] obsID {r200['obsID']}: {len(tbl)} sources found")
 
             img200 = robust_scale(img200)
             img277 = robust_scale(img277)
             img444 = robust_scale(img444)
 
             on200_277 = reproject_to(img200, hdr200, img277, hdr277)
-            on200_444 = reproject_to(img200, hdr200, img444, hdr444)
-
-            _, tbl = detect_sources_on(img200)
-            if tbl is None or len(tbl) == 0:
-                continue
+            on200_444 = reproject_to(img200, hdr200, img444, hdr444)            
 
             for row in tbl:
-                xc = float(row["xcentroid"])
-                yc = float(row["ycentroid"])
-                stamp = cutout_stack(
-                    ref_img=img200,
-                    hdr_ref=hdr200,
-                    imgs_dict={"F200W":img200, "F277W":on200_277, "F444W":on200_444},
-                    xy=(xc, yc),
-                    size_pix=CUTOUT_PIX
-                )
-                X_imgs.append(stamp)
-                X_pooled.append(pooled_features_from_stamp(stamp, grid=POOL_GRID))
-                meta_rows.append({
-                    "ra":float(r200["s_ra"]),
-                    "dec":float(r200["s_dec"]),
-                    "obsID_200": r200["obsID"],
-                    "obsID_277": r277["obsID"],
-                    "obsID_444": r444["obsID"],
-                    "uri_200": r200["dataURI"],
-                    "uri_277": r277["dataURI"],
-                    "uri_444": r444["dataURI"],
-                    "filename_200": r200["productFilename"],
-                    "filename_277": r277["productFilename"],
-                    "filename_444": r444["productFilename"]
-                })
+                try:
+                    xc = float(row["xcentroid"])
+                    yc = float(row["ycentroid"])
+                    stamp = cutout_stack(
+                        ref_img=img200,
+                        hdr_ref=hdr200,
+                        imgs_dict={"F200W":img200, "F277W":on200_277, "F444W":on200_444},
+                        xy=(xc, yc),
+                        size_pix=CUTOUT_PIX
+                    )
+                    X_imgs.append(stamp)
+                    X_pooled.append(pooled_features_from_stamp(stamp, grid=POOL_GRID))
+                    meta_rows.append({
+                        "ra":float(r200["s_ra"]),
+                        "dec":float(r200["s_dec"]),
+                        "obsID_200": r200["obsID"],
+                        "obsID_277": r277["obsID"],
+                        "obsID_444": r444["obsID"],
+                        "uri_200": r200["dataURI"],
+                        "uri_277": r277["dataURI"],
+                        "uri_444": r444["dataURI"],
+                        "filename_200": r200["productFilename"],
+                        "filename_277": r277["productFilename"],
+                        "filename_444": r444["productFilename"]
+                    })
+                except Exception as ex:
+                    warnings.warn(f"Cutout failed for one source in obsID {r200['obsID']}: {e})")
 
         except Exception as e:
             warnings.warn(f"Triplets failed: {e}")
@@ -411,11 +420,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    # for f in ["F200W", "F277W", "F444W"]:
-    #     obs = Observations.query_criteria(
-    #     obs_collection="JWST",
-    #     instrument_name="NIRCAM/IMAGE",
-    #     filters=f,
-    # )
-    # print(f, len(obs))
