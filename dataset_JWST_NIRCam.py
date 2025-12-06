@@ -1,7 +1,8 @@
-import os, io, pathlib, warnings, time, warnings
+import os, io, pathlib, warnings, time, warnings, requests
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from requests import Session
 
 from astroquery.mast import Observations
 from astropy.io import fits
@@ -16,14 +17,21 @@ from photutils.segmentation import SourceCatalog
 from skimage.transform import resize
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stdout
 
 warnings.filterwarnings("ignore", category=FITSFixedWarning)
+
+Observations._session = Session()
+HTTP_SESSION = requests.Session()
+MAST_DOWNLOAD_URL = "https://mast.stsci.edu/api/v0.1/Download/file"
 
 OUT_DIR = pathlib.Path("JWST_NIRCam_Triple_Filter")
 REFENCES_BAND = "F200W" #References filter
 BANDS = ["F200W", "F277W", "F444W"] #it should have 16,242 images catalogues. Public access only, with calibiration level 2-4
 MAX_OBS_PER_BAND = 3500
+MAX_MOSAICS_PER_BAND = 300
+MAX_TRIPLETS = 200
+MAX_SEGM_LABEL = 6500
 
 CALIB_MIN, CALIB_MAX = 2, 4
 MAX_MATCH_ARCSEC = 1.0
@@ -32,6 +40,9 @@ MIN_AREA = 10
 THRESHOLD_SIGMA = 2.0
 MAX_SOURCES_PER_FIELD = 200
 POOL_GRID = 4
+WOKERS_COUNT = 3
+BATCH_SIZE = 150
+CHUNK_SIZE = 1024 * 1024
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 FITS_DIR = OUT_DIR / "fits"
@@ -39,6 +50,8 @@ FITS_DIR.mkdir(exist_ok=True)
 
 CACHE_DIR = OUT_DIR / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+
+Observations.cache_location = FITS_DIR
 
 def cache_save_df(df, band):
     df.to_parquet(CACHE_DIR / f"{band}_products.parquet", index=False)
@@ -58,16 +71,25 @@ def arcsec_sep(ra1, dec1, ra2, dec2):
     return 3600.0 * np.sqrt(x*x + y*y)
 
 def robust_scale(im):
-    im = np.nan_to_num(im, copy = False)
+    print(f"[Scaling] for downloaded .fits")
+    im = np.nan_to_num(im, copy=False)
+    if not np.isfinite(im).any():
+        return np.zeros_like(im, dtype=np.float32)
+    im = im.astype(np.float32, copy=False)
     p1, p99 = np.percentile(im, [1, 99])
+    if not np.isfinite(p1) or not np.isfinite(p99) or p99 <= p1:
+        return np.zeros_like(im, dtype=np.float32)
     im = im - np.median(im)
-    scale = (p99 - p1) if (p99 > p1) else (np.std(im) + 1e-12)
+    scale = (p99 - p1)
     im = (im - p1) / (scale + 1e-12)
     return np.clip(im, -5, 5)
 
 def z_score(im):
+    im = np.nan_to_num(im, copy=False)
     s = np.std(im)
-    return (im - np.mean(im)) / s if s > 0 else (im - np.mean(im))
+    if not np.isfinite(s) or s == 0:
+        return np.zeros_like(im, dtype=np.float32)
+    return (im - np.mean(im)) / s
 
 def is_mosaic_filename(filename):
     return (("_i2d.fits" in filename) or ("_drc.fits" in filename))
@@ -101,30 +123,28 @@ def query_band_products(filter_name, step=1000):
 
     total = len(obs)
     n_batches = (total + step - 1) // step
-    for b in range(n_batches):
+
+    for b in tqdm(range(n_batches), desc=f"Querying {filter_name}", unit="batch"):
         i = b * step
         batch = obs[i:i+step]
-
-        print(f"  → batch {b+1}/{n_batches}: obs[{i}:{i+len(batch)}] ... ", end="", flush=True)
-        t0 = time.time()
-
-        products = Observations.get_product_list(batch)
-
-        if products_table is None:
-            products_table = products
-        else:
-            products_table = vstack([products_table, products])
-
-        dt = time.time() - t0
-        print(f"done ({len(products)} products, {dt:.1f}s)")
+        try:
+            products = Observations.get_product_list(batch)
+            
+            if products_table is None:
+                products_table = products
+            else:
+                products_table = vstack([products_table, products])
+        except Exception as e:
+            print(f"Batch {b+1}/{n_batches} failed: {e}")
+            continue
 
     if products_table is None or len(products_table) == 0:
         print(f"[Warn] No products for {filter_name}")
         return pd.DataFrame()
 
     df = products_table.to_pandas()
-
     df =  df[df["productFilename"].str.endswith(".fits", na=False)].copy()
+    
     if "calib_level" in df.columns:
         df = df[df["calib_level"].isna() | df["calib_level"].between(CALIB_MIN, CALIB_MAX, inclusive="both")]
 
@@ -147,7 +167,8 @@ def query_band_products(filter_name, step=1000):
         print(f"[Warn] obsid/s_ra/s_dec not found in obs table for {filter_name}")
 
     df.drop_duplicates(subset=["productFilename"], inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    df = df.sort_values(["s_ra", "s_dec"]).reset_index(drop=True)
+    df = df.iloc[:MAX_MOSAICS_PER_BAND]
 
     print(f"[Query] {filter_name}: {len(df)} mosaic products kept")
     return df
@@ -211,53 +232,65 @@ def download_if_needed(row):
 
     if dest.exists():
         return dest
-    
-    print(f"[Download] Mosaics for {fname}\n")
+
+    url = f"{MAST_DOWNLOAD_URL}?uri={uri}"
+
     try:
-        buf = io.StringIO()
-        with redirect_stdout(buf), redirect_stderr(buf):
-            Observations.download_file(
-                uri=uri,
-                local_path=str(dest),
-                cache=False,
-            )
+        resp = HTTP_SESSION.get(url, stream=True, timeout=600)
+        resp.raise_for_status()
     except Exception as e:
-        raise RuntimeError(f"Download failed for {uri}: {e}")
-    
-    if not dest.exists():
-        raise RuntimeError(f"File not found after download: {dest}")
+        print(f"[Err] Request failed for {fname}: {e}")
+        raise
+
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+            if not chunk:
+                continue
+            f.write(chunk)
+
+    if not dest.exists() or dest.stat().st_size == 0:
+        raise RuntimeError(f"[Err] Download produced empty file: {dest}")
     return dest
 
-def prefetch_all_fits(df_F200, df_F277, df_F444, max_workers=3):
+def prefetch_all_fits(df_F200, df_F277, df_F444, max_workers=4):
     all_df = pd.concat([df_F200, df_F277, df_F444], ignore_index=True)
     uris = all_df["dataURI"].dropna().unique()
 
+    uri_to_row = {row["dataURI"]: row for _, row in all_df.iterrows()}
+
     def worker(uri):
-        row = {"dataURI": uri}
+        row = uri_to_row[uri]
         try:
             path = download_if_needed(row)
             return (uri, True, str(path))
         except Exception as e:
             return (uri, False, str(e))
-        
-    print(f"[Prefetch] Downloading up to {len(uris)} FITS files with {max_workers} workers...")
+
+    print(f"[Prefetch] Downloading {len(uris)} FITS files with {max_workers} workers...")
+
     results = []
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(worker, uri): uri for uri in uris}
-        with tqdm(total=len(futures), desc="Prefetch FITS", ncols=90) as pbar:
+
+        with tqdm(
+            total=len(futures),
+            desc="Prefetch FITS",
+            unit="file",
+            dynamic_ncols=True,
+        ) as pbar:
             for fut in as_completed(futures):
                 uri = futures[fut]
                 ok_uri, ok_flag, msg = fut.result()
 
                 status = "OK" if ok_flag else "ERR"
-                pbar.set_postfix_str(f"{os.path.basename(ok_uri)} → {status}")
-                results.append((ok_uri, ok_flag, msg))
                 pbar.update(1)
+                pbar.set_postfix_str(f"{status} {os.path.basename(ok_uri)[:25]}")
+                results.append((ok_uri, ok_flag, msg))
 
     n_ok = sum(1 for _, ok, _ in results if ok)
     n_err = len(results) - n_ok
-    print(f"[Prefetch] Done: {n_ok} ok, {n_err} errors")
-
+    print(f"[Prefetch] Done: {n_ok} downloaded, {n_err} errors")
 
 def read_sci(fits_path):
     if isinstance(fits_path, (tuple, list)):
@@ -269,11 +302,11 @@ def read_sci(fits_path):
             data = hdul["SCI"].data
             hdr = hdul["SCI"].header
             if data is not None and data.ndim == 2:
-                return data.astype(np.float64), hdr.copy()
+                return data.astype(np.float32), hdr.copy()
 
         for h in hdul[1:]:
             if h.data is not None and h.data.ndim == 2:
-                return h.data.astype(np.float64), h.header.copy()
+                return h.data.astype(np.float32), h.header.copy()
 
     raise ValueError(f"No 2D SCI image found in {fits_path}")
 
@@ -305,6 +338,10 @@ def detect_sources_on(img):
     if segm is None:
         return None, None
     
+    if segm.nlabels > MAX_SEGM_LABEL:
+        print(f"[Detect] Too many labels ({segm.nlabels}), skipping field")
+        return None, None
+
     segm = deblend_sources(img, segm, npixels=MIN_AREA, nlevels=16, contrast=0.001)
     cat = SourceCatalog(img, segm)
 
@@ -353,15 +390,15 @@ def main():
 
     if df_F200 is None:
         print("[Info] No existing filter cache can be found\n[Info] Querying band from MAST")
-        df_F200 = query_band_products("F200W", step=350)
+        df_F200 = query_band_products("F200W", step=BATCH_SIZE)
         cache_save_df(df_F200, "F200W")
     if df_F277 is None:
         print("[Info] No existing filter cache can be found\n[Info] Querying band from MAST")
-        df_F277 = query_band_products("F277W", step=350)
+        df_F277 = query_band_products("F277W", step=BATCH_SIZE)
         cache_save_df(df_F277, "F277W")
     if df_F444 is None:
         print("[Info] No existing filter cache can be found\n[Info] Querying band from MAST")
-        df_F444 = query_band_products("F444W", step=350)
+        df_F444 = query_band_products("F444W", step=BATCH_SIZE)
         cache_save_df(df_F444, "F444W")
     
     print(f"Filter F200W counts: {len(df_F200)}\nFilter F277W counts: {len(df_F277)}\nFilter F444W counts: {len(df_F444)}")
@@ -372,8 +409,20 @@ def main():
     print(f"Products: F200W = {len(df_F200)}, F277W = {len(df_F277)}, and F444W = {len(df_F444)}")
     triplets = match_triplets(df_F200, df_F277, df_F444, tol_arcsec=MAX_MATCH_ARCSEC)
     print(f"Matched triplets (fields): {len(triplets)}")
+    if len(triplets) > MAX_TRIPLETS:
+        idx = np.random.choice(len(triplets), size=MAX_TRIPLETS, replace=False)
+        triplets = [triplets[i] for i in idx]
+        print(f"[Info] Subsampled triplets to {len(triplets)}")
 
-    prefetch_all_fits(df_F200, df_F277, df_F444, max_workers=4)
+    idx_200 = [i200 for (i200, _, _) in triplets]
+    idx_277 = [i277 for (_, i277, _) in triplets]
+    idx_444 = [i444 for (_, _, i444) in triplets]
+
+    df_F200_sub = df_F200.loc[idx_200].reset_index(drop=True)
+    df_F277_sub = df_F277.loc[idx_277].reset_index(drop=True)
+    df_F444_sub = df_F444.loc[idx_444].reset_index(drop=True)
+
+    prefetch_all_fits(df_F200_sub, df_F277_sub, df_F444_sub, max_workers=WOKERS_COUNT)
 
     X_imgs = []
     X_pooled = []
@@ -384,9 +433,14 @@ def main():
         r444 = df_F444.loc[i444]
 
         try:
-            f200 = download_if_needed(r200)
-            f277 = download_if_needed(r277)
-            f444 = download_if_needed(r444)
+            f200 = FITS_DIR / r200["productFilename"]
+            f277 = FITS_DIR / r277["productFilename"]
+            f444 = FITS_DIR / r444["productFilename"]
+            if not (f200.exists() and f277.exists() and f444.exists()):
+                print(f"[Download] Missing files for triplet {i200}, {i277}, {i444}\n[Download] Redownload triplets")
+                f200 = download_if_needed(r200)
+                f277 = download_if_needed(r277)
+                f444 = download_if_needed(r444)
 
             img200, hdr200 = read_sci(f200)
             img277, hdr277 = read_sci(f277)
@@ -432,7 +486,7 @@ def main():
                         "filename_444": r444["productFilename"]
                     })
                 except Exception as ex:
-                    warnings.warn(f"Cutout failed for one source in obsID {r200['obsID']}: {e})")
+                    warnings.warn(f"Cutout failed for one source in obsID {r200['obsID']}: {ex})")
 
         except Exception as e:
             warnings.warn(f"Triplets failed: {e}")
