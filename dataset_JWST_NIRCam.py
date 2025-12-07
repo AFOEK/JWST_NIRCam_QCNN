@@ -6,10 +6,12 @@ from requests import Session
 
 from astroquery.mast import Observations
 from astropy.io import fits
+from astropy import units as u
 from astropy.wcs import WCS, FITSFixedWarning
 from astropy.table import vstack
 from astropy.stats import sigma_clipped_stats
 from astropy.nddata import Cutout2D
+from astropy.coordinates import SkyCoord
 from reproject import reproject_interp
 
 from photutils.segmentation import detect_threshold, detect_sources, deblend_sources
@@ -470,11 +472,16 @@ def main():
                         xy=(xc, yc),
                         size_pix=CUTOUT_PIX
                     )
+                    sky = WCS(hdr200).pixel_to_world(xc, yc)
+                    ra_src = float(sky.ra.deg)
+                    dec_src = float(sky.dec.deg)
                     X_imgs.append(stamp)
                     X_pooled.append(pooled_features_from_stamp(stamp, grid=POOL_GRID))
                     meta_rows.append({
                         "ra":float(r200["s_ra"]),
                         "dec":float(r200["s_dec"]),
+                        "ra_src": ra_src,
+                        "dec_src": dec_src,
                         "obsID_200": r200["obsID"],
                         "obsID_277": r277["obsID"],
                         "obsID_444": r444["obsID"],
