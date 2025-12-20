@@ -1,0 +1,8 @@
+tqdm
+photutils
+astropy
+astroquery
+scikit-learn
+scipy
+pandas
+numpy
