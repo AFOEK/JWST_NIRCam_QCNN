@@ -464,6 +464,7 @@ def run_labeling(save_every=50, retry_unlabeled_only=False):
                 tqdm.write(f"[DBG] Saved files to {OUT_PATH}")
                 meta.to_csv(OUT_PATH, index=False)
                 processed_since_save = 0
+                last_save_t = now
             continue
 
         meta.at[i, "gaia_source_id"]    = r["gaia_source_id"]
@@ -513,6 +514,7 @@ def run_labeling(save_every=50, retry_unlabeled_only=False):
             tqdm.write(f"[DBG] Saved files to {OUT_PATH}")
             meta.to_csv(OUT_PATH, index=False)
             processed_since_save = 0
+            last_save_t = now
 
     meta.to_csv(OUT_PATH, index=False)
     print(f"[Info] Saved progress to {OUT_PATH}")
@@ -670,7 +672,7 @@ else:
 
 if __name__ == "__main__":
     print("[Info] Fetching Catalogs data...")
-    run_labeling(save_every=10, retry_unlabeled_only=True)
+    run_labeling(save_every=10, retry_unlabeled_only=False)
     meta["target"] = meta.apply(decide_target, axis=1)
     meta.to_csv(OUT_PATH, index=False)
     print(f"[Info] Saved progress + targets to {OUT_PATH}")
