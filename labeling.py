@@ -274,18 +274,21 @@ def query_catalogs_for_index(idx):
     res, s_err = query_simbad_with_retry(c)
     if res is not None and len(res) > 0:
         tqdm.write(f"[DBG] idx {idx} -> SIMBAD")
-        ra_s = np.array(res["RA"], dtype=str)
-        dec_s = np.array(res["DEC"], dtype=str)
-        s_coords = SkyCoord(ra_s, dec_s, unit=(u.hourangle, u.deg))
+        if ("ra" in res.colnames) and ("dec" in res.colnames):
+            ra_s = np.array(res["ra"], dtype=str)
+            dec_s = np.array(res["dec"], dtype=str)
+            s_coords = SkyCoord(ra_s, dec_s, unit=(u.hourangle, u.deg))
 
-        sep = c.separation(s_coords)
-        j_min = np.argmin(sep)
-        out["simbad_sep_arcsec"] = float(sep[j_min].arcsec)
+            sep = c.separation(s_coords)
+            j_min = int(np.argmin(sep))
+            out["simbad_sep_arcsec"] = float(sep[j_min].arcsec)
+            row = res[j_min]
+        else:
+            out["simbad_sep_arcsec"] = np.nan
+            row = res[0]
 
-        row = res[j_min]
-        main_id = row["MAIN_ID"]
-        otype = row["OTYPE"]
-
+        main_id = row["main_id"]
+        otype = row["otype"]
         out["simbad_main_id"] = main_id.decode() if isinstance(main_id, bytes) else main_id
         out["simbad_type"] = otype.decode() if isinstance(otype, bytes) else otype
     elif s_err is not None:
@@ -459,6 +462,7 @@ def run_labeling(save_every=50, retry_unlabeled_only=False):
             tqdm.write(f"[Err] index {i} failed: {e}")
             meta.at[i, "labeled_done"] = True
             processed_since_save += 1
+            now = time.time()
 
             if processed_since_save >= save_every or (now - last_save_t) >= 60:
                 tqdm.write(f"[DBG] Saved files to {OUT_PATH}")
