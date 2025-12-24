@@ -540,13 +540,21 @@ def decide_target(row):
     simbad_vote = None
     st = row.get("simbad_type", None)
     if isinstance(st, str):
-        st_upper = st.upper()
-        if "STAR" in st_upper or st_upper in ["*", "**", "SB*"]:
+        t = st.strip().upper()
+        # --- STAR-ish (SIMBAD has lots of compact codes) ---
+        if (t in {"*", "**", "SB*", "WD*", "BD*", "PM*", "V*"} or
+            "STAR" in t or t.endswith("*")):
             simbad_vote = "star"
-        elif "GALAXY" in st_upper or st_upper in ["G", "GIN", "GIC"]:
-            simbad_vote = "galaxy"
-        elif "QSO" in st_upper or "AGN" in st_upper or "BLL" in st_upper:
+        # --- AGN/QSO-ish ---
+        elif (t in {"QSO", "AGN", "BLL", "BLAZAR", "SY1", "SY2", "LIN", "SEYFERT"} or
+            "QSO" in t or "AGN" in t or "BLAZAR" in t or "SEYFERT" in t):
             simbad_vote = "agn"
+        # --- GALAXY-ish ---
+        elif (t in {"G", "GAL", "GALAXY", "EMG", "HII", "IG"} or
+            "GALAXY" in t or "HII" in t):
+            simbad_vote = "galaxy"
+        elif t in {"X", "RAD", "IR", "IRS"}:
+            simbad_vote = None  
 
     if simbad_vote is not None:
         label_scores[simbad_vote] += weights["simbad"]
@@ -554,16 +562,25 @@ def decide_target(row):
     ned_vote = None
     nt = row.get("ned_type", None)
     if isinstance(nt, str):
-        ntu = nt.upper()
-        if "STAR" in ntu:
+        t = nt.strip().upper()
+        # direct
+        if "STAR" in t:
             ned_vote = "star"
-        elif "GALAXY" in ntu or "HII" in ntu:
-            ned_vote = "galaxy"
-        elif "QSO" in ntu or "AGN" in ntu or "BL LAC" in ntu:
+        elif t in {"QSO", "AGN", "BLLAC", "BL LAC", "SEYFERT", "SY1", "SY2", "LINER"} or "QSO" in t or "AGN" in t:
             ned_vote = "agn"
+        elif t in {"G", "GALAXY", "HII", "EMG"} or "GALAXY" in t or "HII" in t:
+            ned_vote = "galaxy"
+        elif t in {"IRS", "IRSRC", "IRSOURCE", "IR", "IRAS", "WISE"} or "IR" in t:
+            # NED "IrS" (Infrared Source) is often a galaxy/AGN host.
+            # If it has redshift -> almost surely extragalactic.
+            if pd.notna(row.get("ned_z", np.nan)):
+                ned_vote = "galaxy"
+            else:
+                ned_vote = "galaxy"
 
-    if ned_vote is not None:
-        label_scores[ned_vote] += weights["ned"]
+    if ned_vote is None and pd.notna(row.get("ned_z", np.nan)):
+        ned_vote = "galaxy"
+        label_scores["galaxy"] += 2.0
 
     sdss_vote = None
     sdclass = row.get("sdss_class", None)
