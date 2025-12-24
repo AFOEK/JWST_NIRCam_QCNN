@@ -575,8 +575,9 @@ def decide_target(row):
             # If it has redshift -> almost surely extragalactic.
             if pd.notna(row.get("ned_z", np.nan)):
                 ned_vote = "galaxy"
-            else:
-                ned_vote = "galaxy"
+    
+    if ned_vote is not None:
+        label_scores[ned_vote] += weights["ned"]
 
     if ned_vote is None and pd.notna(row.get("ned_z", np.nan)):
         ned_vote = "galaxy"
