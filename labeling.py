@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-import time, os, logging, warnings
+import time, os, logging, warnings, re
 
 from tqdm import tqdm
 from collections import Counter
@@ -14,6 +14,9 @@ from astroquery.ipac.irsa import Irsa
 from astroquery.sdss import SDSS
 from astroquery.mast import Catalogs
 from astroquery.ipac.ned import Ned
+from astropy.table import Table
+from astroquery.xmatch import XMatch
+from astroquery.vizier import Vizier
 
 from astroquery.exceptions import NoResultsWarning
 
@@ -58,6 +61,46 @@ SDSS.TIMEOUT = 50
 Ned.TIMEOUT = 45
 Catalogs.TIMEOUT = 40
 
+XRAD_DEFAULT_CHUNK = 1200
+XRAD_SAVE_EVERY_CHUNKS = 1
+XRAD_SLEEP = 0.25
+
+_num = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
+XRAD_CATALOGS = {
+    "lotss": {
+        "table": "J/A+A/634/A133/table",
+        "ra2": "RAJ2000", "dec2": "DEJ2000",
+        "max_dist": 3.5 * u.arcsec,
+        "chunk": 1500,
+    },
+    "vlass": {
+        "table": "J/ApJS/255/30/comp",
+        "ra2": "RAJ2000", "dec2": "DEJ2000",
+        "max_dist": 1.5 * u.arcsec,
+        "chunk": 600,
+    },
+    "chandra": {
+        "table": "IX/70/csc21mas",
+        "ra2": "RAICRS", "dec2": "DEICRS",
+        "max_dist": 2.5 * u.arcsec,
+        "chunk": 1200,
+    },
+    "xmm": {
+        "table_try": [
+            "IX/69/xmm4d13s",
+            "IX/69/xmm4d13s/xmm4d13s",
+            "IX/69/xmm4d13s/summary",
+        ],
+        "max_dist": 4.0 * u.arcsec,
+        "chunk": 900,
+        "probe_radec": True,
+    },
+    "erosita_s": {"table": "J/A+A/682/A34/erass1-s", "ra2": "RA_ICRS", "dec2": "DE_ICRS", "max_dist": 5.0 * u.arcsec, "chunk": 1200},
+    "erosita_m": {"table": "J/A+A/682/A34/erass1-m", "ra2": "RA_ICRS", "dec2": "DE_ICRS", "max_dist": 5.0 * u.arcsec, "chunk": 1200},
+    "erosita_h": {"table": "J/A+A/682/A34/erass1-h", "ra2": "RA_ICRS", "dec2": "DE_ICRS", "max_dist": 5.0 * u.arcsec, "chunk": 1200},
+}
+
 if os.path.exists(OUT_PATH):
     print(f"[Info] Resuming from existing labeled file: {OUT_PATH}")
     meta = pd.read_csv(OUT_PATH)
@@ -80,6 +123,212 @@ def ensure_col(name, default=np.nan, dtype=None):
             meta[name] = pd.Series([None] * len(meta), dtype="object")
         else:
             meta[name] = default
+
+def xrad_to_upload_table(df_slice: pd.DataFrame) -> Table:
+    t = Table.from_pandas(df_slice[["row_id", RA_COL, DEC_COL]].copy())
+    t.rename_column(RA_COL, "RA")
+    t.rename_column(DEC_COL, "DEC")
+    return t
+
+def xrad_angdist_to_arcsec(x):
+    if hasattr(x, "to_value"):
+        return float(x.to_value(u.arcsec))
+    if isinstance(x, (bytes, bytearray)):
+        x = x.decode(errors="ignore")
+    if isinstance(x, str):
+        m = _num.search(x)
+        if not m:
+            return np.nan
+        val = float(m.group(0))
+        s = x.lower()
+        if "deg" in s:
+            return val * 3600.0
+        if "arcmin" in s:
+            return val * 60.0
+        return val
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+def xrad_keep_nearest(md: pd.DataFrame) -> pd.DataFrame:
+    if md is None or len(md) == 0:
+        return pd.DataFrame(columns=["row_id"])
+    if "angDist" not in md.columns:
+        return pd.DataFrame(columns=["row_id"])
+    md = md.copy()
+    md["angDist"] = [xrad_angdist_to_arcsec(v) for v in md["angDist"]]
+    md = md.dropna(subset=["angDist"])
+    if len(md) == 0:
+        return pd.DataFrame(columns=["row_id"])
+    md = md.sort_values("angDist").groupby("row_id", as_index=False).first()
+    return md
+
+def xrad_choose_id_col(md: pd.DataFrame):
+    cols = {c.lower(): c for c in md.columns}
+    preferred = ["4xmm", "2cxo", "srcid", "iauname", "iau_name", "name", "source_name", "source", "id", "designation", "objid"]
+    for k in preferred:
+        if k in cols:
+            return cols[k]
+    ban = {"row_id", "angdist", "ra", "dec", "raj2000", "dej2000", "ra_icrs", "de_icrs", "raicrs", "deicrs"}
+    for c in md.columns:
+        if c.lower() not in ban:
+            return c
+    return None
+
+def xrad_probe_cat2_radec(cat2_table: str, max_dist: u.Quantity):
+    upload = Table({"row_id": [0], "RA": [10.0], "DEC": [10.0]})
+    candidates = [
+        ("RAJ2000", "DEJ2000"),
+        ("_RAJ2000", "_DEJ2000"),
+        ("RA_ICRS", "DE_ICRS"),
+        ("RAICRS", "DEICRS"),
+        ("_RA.icrs", "_DE.icrs"),
+        ("RA", "DEC"),
+    ]
+    last_err = None
+    for ra2, dec2 in candidates:
+        try:
+            XMatch.query(
+                cat1=upload,
+                cat2=f"vizier:{cat2_table}",
+                max_distance=max_dist,
+                colRA1="RA",
+                colDec1="DEC",
+                colRA2=ra2,
+                colDec2=dec2,
+            )
+            return ra2, dec2
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Probe failed for {cat2_table}. Last error: {last_err}")
+
+def xrad_atomic_save():
+    meta.to_csv(OUT_PATH, index=False)
+
+def xrad_xmatch(upload: Table, table_id: str, max_dist: u.Quantity, ra2: str, dec2: str):
+    res = XMatch.query(
+        cat1=upload,
+        cat2=f"vizier:{table_id}",
+        max_distance=max_dist,
+        colRA1="RA",
+        colDec1="DEC",
+        colRA2=ra2,
+        colDec2=dec2,
+    )
+    if res is None or len(res) == 0:
+        return pd.DataFrame(columns=["row_id"])
+    return res.to_pandas()
+
+def run_xray_radio(save_every_chunks=1):
+    # stable row_id for merges
+    if "row_id" not in meta.columns:
+        meta["row_id"] = np.arange(len(meta), dtype=np.int64)
+
+    for name, cfg in XRAD_CATALOGS.items():
+        id_col = f"{name}_object_id"
+        sep_col = f"{name}_sep_arcsec"
+        ensure_col(id_col, dtype="object")
+        ensure_col(sep_col)
+
+        pending = meta.index[meta[id_col].isna()].tolist()
+        if not pending:
+            print(f"[XRAD] {name}: nothing to do.")
+            continue
+
+        max_dist = cfg.get("max_dist", 3.0 * u.arcsec)
+        chunk = int(cfg.get("chunk", XRAD_DEFAULT_CHUNK))
+
+        # Resolve table + radec (XMM probing)
+        if cfg.get("probe_radec", False):
+            table_try = cfg.get("table_try", [])
+            table_ok = None
+            ra2_ok = None
+            dec2_ok = None
+            for tid in table_try:
+                try:
+                    ra2, dec2 = xrad_probe_cat2_radec(tid, max_dist=max_dist)
+                    table_ok, ra2_ok, dec2_ok = tid, ra2, dec2
+                    break
+                except Exception as e:
+                    print(f"[XRAD] {name}: probe failed for {tid}: {e}")
+            if table_ok is None:
+                print(f"[XRAD] {name}: could not find working table for XMatch, skipping.")
+                continue
+            table_id, ra2, dec2 = table_ok, ra2_ok, dec2_ok
+        else:
+            table_id, ra2, dec2 = cfg["table"], cfg["ra2"], cfg["dec2"]
+
+        print(f"[XRAD] {name}: table={table_id} ra2={ra2} dec2={dec2} max_dist={max_dist} pending={len(pending)}/{len(meta)}")
+
+        chunks_done = 0
+        for start in tqdm(range(0, len(pending), chunk), desc=f"XRAD {name}", unit="chunk"):
+            idxs = pending[start:start + chunk]
+
+            sl = meta.loc[idxs, ["row_id", RA_COL, DEC_COL]].copy()
+            sl[RA_COL] = pd.to_numeric(sl[RA_COL], errors="coerce")
+            sl[DEC_COL] = pd.to_numeric(sl[DEC_COL], errors="coerce")
+            sl = sl.dropna(subset=[RA_COL, DEC_COL])
+            if sl.empty:
+                continue
+
+            upload = xrad_to_upload_table(sl)
+
+            md = None
+            for attempt in range(3):
+                try:
+                    md = xrad_xmatch(upload, table_id, max_dist, ra2, dec2)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        print(f"\n[XRAD] {name} chunk failed: {e}")
+                    time.sleep(1.0 * (attempt + 1))
+
+            if md is None or len(md) == 0:
+                chunks_done += 1
+                if chunks_done % save_every_chunks == 0:
+                    xrad_atomic_save()
+                time.sleep(XRAD_SLEEP)
+                continue
+
+            md = xrad_keep_nearest(md)
+            if len(md) == 0:
+                chunks_done += 1
+                if chunks_done % save_every_chunks == 0:
+                    xrad_atomic_save()
+                time.sleep(XRAD_SLEEP)
+                continue
+
+            cat_id_col = xrad_choose_id_col(md)
+
+            # IMPORTANT: avoid pandas dtype warnings by ensuring object dtype for IDs
+            if meta[id_col].dtype != "object":
+                meta[id_col] = meta[id_col].astype("object")
+
+            # merge by row_id
+            upd = md[["row_id", "angDist"]].copy()
+            upd.rename(columns={"angDist": sep_col}, inplace=True)
+            if cat_id_col is not None:
+                upd[id_col] = md[cat_id_col].astype(str)
+
+            meta.set_index("row_id", inplace=True)
+            upd = upd.set_index("row_id")
+
+            meta.loc[upd.index, sep_col] = upd[sep_col].astype(float)
+            if id_col in upd.columns:
+                meta.loc[upd.index, id_col] = upd[id_col].astype("object")
+
+            meta.reset_index(inplace=True)
+
+            chunks_done += 1
+            if chunks_done % save_every_chunks == 0:
+                xrad_atomic_save()
+
+            time.sleep(XRAD_SLEEP)
+
+        xrad_atomic_save()
+        print(f"[XRAD] {name}: done + saved.")
+
 
 def query_gaia_with_retry(c, max_retries=3, sleep_base=2.0):
     last_err = None
@@ -526,13 +775,22 @@ def run_labeling(save_every=50, retry_unlabeled_only=False):
 
 def decide_target(row):
     weights = {
-        "gaia":   2.5,   # GAIA: strong but not absolute
-        "simbad": 3.0,   # SIMBAD type: very trusted
-        "ned":    3.0,   # NED type: very trusted
-        "sdss":   3.0,   # SDSS spectroscopic class
-        "wise":   1.5,   # WISE color hint (AGN-ish)
-        "tmass":  1.0,   # 2MASS color hint (star-ish)
-        "ps1":    1.0,   # PS1 color hint (star-ish)
+        "gaia":   2.5,  # GAIA: strong star signal (parallax/pm/photometry), but not absolute
+        "simbad": 3.0,  # SIMBAD type: usually very reliable when present
+        "ned":    3.0,  # NED type/redshift: very reliable for extragalactic IDs
+        "sdss":   3.0,  # SDSS spectroscopic class: extremely strong when available
+        "wise":   1.5,  # WISE color (e.g., W1-W2): decent AGN hint, but can be messy
+        "tmass":  1.0,  # 2MASS colors: mild star-ish hint
+        "ps1":    1.0,  # PS1 colors: mild star-ish hint
+
+        "chandra":   2.0,  # Chandra X-ray: strong high-energy evidence (often AGN, sometimes XRB/CV)
+        "xmm":       1.5,  # XMM X-ray: strong but a bit broader/shallower than Chandra (more confusion)
+        "erosita_s": 1.5,  # eROSITA soft band: good X-ray evidence, but soft can include stars/CVs too
+        "erosita_m": 1.0,  # eROSITA medium band: evidence, but you have few matches; keep moderate
+        "erosita_h": 1.0,  # eROSITA hard band: strong AGN-ish when present, but you have ~0 matches now
+
+        "lotss": 1.5,  # LoTSS radio: good AGN/jet hint, but radio galaxies/SF galaxies exist too
+        "vlass": 1.0,  # VLASS radio: higher-res radio; useful, but you currently have very few matches
     }
 
     label_scores = {"star": 0.0, "galaxy": 0.0, "agn": 0.0}
@@ -563,7 +821,6 @@ def decide_target(row):
     nt = row.get("ned_type", None)
     if isinstance(nt, str):
         t = nt.strip().upper()
-        # direct
         if "STAR" in t:
             ned_vote = "star"
         elif t in {"QSO", "AGN", "BLLAC", "BL LAC", "SEYFERT", "SY1", "SY2", "LINER"} or "QSO" in t or "AGN" in t:
@@ -571,8 +828,6 @@ def decide_target(row):
         elif t in {"G", "GALAXY", "HII", "EMG"} or "GALAXY" in t or "HII" in t:
             ned_vote = "galaxy"
         elif t in {"IRS", "IRSRC", "IRSOURCE", "IR", "IRAS", "WISE"} or "IR" in t:
-            # NED "IrS" (Infrared Source) is often a galaxy/AGN host.
-            # If it has redshift -> almost surely extragalactic.
             if pd.notna(row.get("ned_z", np.nan)):
                 ned_vote = "galaxy"
     
@@ -627,6 +882,51 @@ def decide_target(row):
 
     if all(score == 0.0 for score in label_scores.values()):
         return "unlabeled"
+    
+    def has_match(obj_col, sep_col=None, max_sep_arcsec=None):
+        v = row.get(obj_col, None)
+        if v is None or pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
+            return False
+        if sep_col is None or max_sep_arcsec is None:
+            return True
+        s = row.get(sep_col, np.nan)
+        if pd.isna(s):
+            return True
+        
+        try:
+            return float(s) <= float(max_sep_arcsec)
+        except Exception:
+            return True
+    
+    XRAY_MAX_SEP = 3.0
+    RADIO_MAX_SEP = 3.0
+
+    if has_match("chandra_object_id", "chandra_sep_arcsec", XRAY_MAX_SEP):
+        label_scores["agn"] += weights["chandra"]
+
+    if has_match("xmm_object_id", "xmm_sep_arcsec", XRAY_MAX_SEP):
+        label_scores["agn"] += weights["xmm"]
+
+    if has_match("erosita_s_object_id", "erosita_s_sep_arcsec", XRAY_MAX_SEP):
+        label_scores["agn"] += weights["erosita_s"]
+
+    if has_match("erosita_m_object_id", "erosita_m_sep_arcsec", XRAY_MAX_SEP):
+        label_scores["agn"] += weights["erosita_m"]
+
+    if has_match("erosita_h_object_id", "erosita_h_sep_arcsec", XRAY_MAX_SEP):
+        label_scores["agn"] += weights["erosita_h"]
+
+    if has_match("lotss_object_id", "lotss_sep_arcsec", RADIO_MAX_SEP):
+        if wise_vote == "agn":
+            label_scores["agn"] += weights["lotss"]
+        else:
+            label_scores["galaxy"] += 0.6 * weights["lotss"]
+
+    if has_match("vlass_object_id", "vlass_sep_arcsec", RADIO_MAX_SEP):
+        if wise_vote == "agn":
+            label_scores["agn"] += weights["vlass"]
+        else:
+            label_scores["galaxy"] += 0.6 * weights["vlass"]
 
     sorted_scores = sorted(label_scores.items(), key=lambda kv: kv[1], reverse=True)
     best_label, best_score = sorted_scores[0]
@@ -695,6 +995,8 @@ else:
 if __name__ == "__main__":
     print("[Info] Fetching Catalogs data...")
     run_labeling(save_every=10, retry_unlabeled_only=False)
+    print("[Info] Fetching X-ray / Radio crossmatches...")
+    run_xray_radio(save_every_chunks=1)
     meta["target"] = meta.apply(decide_target, axis=1)
     meta.to_csv(OUT_PATH, index=False)
     print(f"[Info] Saved progress + targets to {OUT_PATH}")
