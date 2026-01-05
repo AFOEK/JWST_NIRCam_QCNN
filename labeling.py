@@ -71,13 +71,13 @@ XRAD_CATALOGS = {
     "lotss": {
         "table": "J/A+A/634/A133/table",
         "ra2": "RAJ2000", "dec2": "DEJ2000",
-        "max_dist": 3.5 * u.arcsec,
+        "max_dist": 4.0 * u.arcsec,
         "chunk": 1500,
     },
     "vlass": {
         "table": "J/ApJS/255/30/comp",
         "ra2": "RAJ2000", "dec2": "DEJ2000",
-        "max_dist": 1.5 * u.arcsec,
+        "max_dist": 2.0 * u.arcsec,
         "chunk": 600,
     },
     "chandra": {
@@ -221,7 +221,6 @@ def xrad_xmatch(upload: Table, table_id: str, max_dist: u.Quantity, ra2: str, de
     return res.to_pandas()
 
 def run_xray_radio(save_every_chunks=1):
-    # stable row_id for merges
     if "row_id" not in meta.columns:
         meta["row_id"] = np.arange(len(meta), dtype=np.int64)
 
@@ -231,7 +230,11 @@ def run_xray_radio(save_every_chunks=1):
         ensure_col(id_col, dtype="object")
         ensure_col(sep_col)
 
-        pending = meta.index[meta[id_col].isna()].tolist()
+        if "labeled_done" in meta.columns:
+            pending = meta.index[meta[id_col].isna() & (~meta["labeled_done"].astype(bool))].tolist()
+        else:
+            pending = meta.index[meta[id_col].isna()].tolist()
+
         if not pending:
             print(f"[XRAD] {name}: nothing to do.")
             continue
@@ -328,6 +331,60 @@ def run_xray_radio(save_every_chunks=1):
 
         xrad_atomic_save()
         print(f"[XRAD] {name}: done + saved.")
+
+
+def _get_float(row, key):
+    try:
+        v = row[key]
+    except Exception:
+        return np.nan
+    if v is None:
+        return np.nan
+    try:
+        if np.ma.is_masked(v):
+            return np.nan
+    except Exception:
+        pass
+    try:
+        return float(v)
+    except Exception:
+        return np.nan
+
+def _get_str(row, key):
+    try:
+        v = row[key]
+    except Exception:
+        return None
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            return v.decode()
+        except Exception:
+            return str(v)
+    return str(v)
+
+def compute_pm_and_sig(row):
+    pmra = _get_float(row, "pmra")
+    pmdec = _get_float(row, "pmdec")
+
+    if np.isfinite(pmra) and np.isfinite(pmdec):
+        pm = float(np.hypot(pmra, pmdec))
+    else:
+        pm = _get_float(row, "pm")
+
+    pm_over_error = np.nan
+    pmra_e = _get_float(row, "pmra_error")
+    pmdec_e = _get_float(row, "pmdec_error")
+
+    if np.isfinite(pm) and np.isfinite(pmra_e) and np.isfinite(pmdec_e):
+        pm_err = float(np.hypot(pmra_e, pmdec_e))
+        if pm_err > 0:
+            pm_over_error = pm / pm_err
+    else:
+        pm_over_error = _get_float(row, "pm_over_error")
+
+    return pm, pm_over_error
 
 
 def query_gaia_with_retry(c, max_retries=3, sleep_base=2.0):
@@ -460,6 +517,10 @@ def query_catalogs_for_index(idx):
         "gaia_source_id": None,
         "gaia_g": np.nan,
         "gaia_bp_rp": np.nan,
+        "gaia_parallax": np.nan,
+        "gaia_parallax_over_error": np.nan,
+        "gaia_pm": np.nan,
+        "gaia_pm_over_error": np.nan,
         
         "simbad_main_id": None,
         "simbad_type": None,
@@ -487,7 +548,6 @@ def query_catalogs_for_index(idx):
         "wise_w1": np.nan,
         "wise_w2": np.nan,
         "wise_w1_w2": np.nan,
-        "wise_sep_arcsec": np.nan,
 
         "gaia_sep_arcsec": np.nan,
         "simbad_sep_arcsec": np.nan,
@@ -501,22 +561,35 @@ def query_catalogs_for_index(idx):
     r, g_err = query_gaia_with_retry(c)
     if r is not None and len(r) > 0:
         tqdm.write(f"[DBG] idx {idx} -> GAIA")
+
         ra_g = np.array(r["ra"], dtype=float)
         dec_g = np.array(r["dec"], dtype=float)
-        gaia_coords = SkyCoord(ra_g, dec_g, unit="deg")
+        gaia_coords = SkyCoord(ra_g * u.deg, dec_g * u.deg)
 
         sep = c.separation(gaia_coords)
-        j_min = np.argmin(sep)
+        j_min = int(np.argmin(sep))
         out["gaia_sep_arcsec"] = float(sep[j_min].arcsec)
 
         row = r[j_min]
-        out["gaia_source_id"] = str(row["source_id"])
 
-        gmag = row["phot_g_mean_mag"]
-        out["gaia_g"] = float(gmag) if (gmag is not None and not np.ma.is_masked(gmag)) else np.nan
+        out["gaia_source_id"] = _get_str(row, "source_id")
 
-        bp_rp = row["bp_rp"]
-        out["gaia_bp_rp"] = float(bp_rp) if (bp_rp is not None and not np.ma.is_masked(bp_rp)) else np.nan
+        out["gaia_g"] = _get_float(row, "phot_g_mean_mag")
+        out["gaia_bp_rp"] = _get_float(row, "bp_rp")
+
+        out["gaia_parallax"] = _get_float(row, "parallax")
+        poe = _get_float(row, "parallax_over_error")
+        if np.isfinite(poe):
+            out["gaia_parallax_over_error"] = poe
+        else:
+            pe = _get_float(row, "parallax_error")
+            if np.isfinite(out["gaia_parallax"]) and np.isfinite(pe) and pe > 0:
+                out["gaia_parallax_over_error"] = out["gaia_parallax"] / pe
+
+        pm, pm_over = compute_pm_and_sig(row)
+        out["gaia_pm"] = pm
+        out["gaia_pm_over_error"] = pm_over
+
     elif g_err is not None:
         print(f"[GAIA] index {idx}: giving up after retries: {g_err}")
 
@@ -723,6 +796,10 @@ def run_labeling(save_every=50, retry_unlabeled_only=False):
         meta.at[i, "gaia_source_id"]    = r["gaia_source_id"]
         meta.at[i, "gaia_g"]            = r["gaia_g"]
         meta.at[i, "gaia_bp_rp"]        = r["gaia_bp_rp"]
+        meta.at[i, "gaia_parallax"]            = r["gaia_parallax"]
+        meta.at[i, "gaia_parallax_over_error"] = r["gaia_parallax_over_error"]
+        meta.at[i, "gaia_pm"]                  = r["gaia_pm"]
+        meta.at[i, "gaia_pm_over_error"]       = r["gaia_pm_over_error"]
 
         meta.at[i, "simbad_main_id"]    = r["simbad_main_id"]
         meta.at[i, "simbad_type"]       = r["simbad_type"]
@@ -775,7 +852,7 @@ def run_labeling(save_every=50, retry_unlabeled_only=False):
 
 def decide_target(row):
     weights = {
-        "gaia":   2.5,  # GAIA: strong star signal (parallax/pm/photometry), but not absolute
+        "gaia":   3.5,  # GAIA: strong star signal (parallax/pm/photometry), but not absolute
         "simbad": 3.0,  # SIMBAD type: usually very reliable when present
         "ned":    3.0,  # NED type/redshift: very reliable for extragalactic IDs
         "sdss":   3.0,  # SDSS spectroscopic class: extremely strong when available
@@ -853,9 +930,26 @@ def decide_target(row):
         label_scores[sdss_vote] += weights["sdss"]
 
     gaia_vote = None
-    if pd.notna(row.get("gaia_g", np.nan)):
+    plx_snr = row.get("gaia_parallax_over_error", np.nan)
+    pm_snr  = row.get("gaia_pm_over_error", np.nan)
+    plx     = row.get("gaia_parallax", np.nan) 
+
+    strong_astrometry = (pd.notna(plx_snr) and plx_snr >= 5.0) or (pd.notna(pm_snr) and pm_snr >= 5.0)
+    parallax_sane = (pd.notna(plx) and plx > 0.2)
+
+    if strong_astrometry and (parallax_sane or (pd.notna(pm_snr) and pm_snr >= 10.0)):
         gaia_vote = "star"
-        label_scores[gaia_vote] += weights["gaia"]
+        label_scores["star"] += weights["gaia"]
+
+        gaia_sep = row.get("gaia_sep_arcsec", np.nan)
+        if pd.notna(gaia_sep) and gaia_sep > 0.7:
+            label_scores["star"] -= 1.0
+
+    if gaia_vote == "star":
+        if label_scores["agn"] < label_scores["star"] + 1.0:
+            return "star"
+
+    
 
     wise_vote = None
     w1w2 = row.get("wise_w1_w2", np.nan)
@@ -885,8 +979,12 @@ def decide_target(row):
     
     def has_match(obj_col, sep_col=None, max_sep_arcsec=None):
         v = row.get(obj_col, None)
-        if v is None or pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
+        if v is None or pd.isna(v):
             return False
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s == "" or s in {"nan", "none", "null"}:
+                return False
         if sep_col is None or max_sep_arcsec is None:
             return True
         s = row.get(sep_col, np.nan)
@@ -952,6 +1050,10 @@ def decide_target(row):
 ensure_col("gaia_source_id", dtype="object")
 ensure_col("gaia_g")
 ensure_col("gaia_bp_rp")
+ensure_col("gaia_parallax")
+ensure_col("gaia_parallax_over_error")
+ensure_col("gaia_pm")
+ensure_col("gaia_pm_over_error")
 ensure_col("gaia_sep_arcsec")
 
 ensure_col("simbad_main_id", dtype="object")
@@ -996,7 +1098,7 @@ if __name__ == "__main__":
     print("[Info] Fetching Catalogs data...")
     run_labeling(save_every=10, retry_unlabeled_only=False)
     print("[Info] Fetching X-ray / Radio crossmatches...")
-    run_xray_radio(save_every_chunks=1)
+    #run_xray_radio(save_every_chunks=1)
     meta["target"] = meta.apply(decide_target, axis=1)
     meta.to_csv(OUT_PATH, index=False)
     print(f"[Info] Saved progress + targets to {OUT_PATH}")
